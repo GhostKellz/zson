@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/ziglang/logo/master/zig-logo.svg" width="80" height="80" alt="Zig Logo">
+  <img src="https://raw.githubusercontent.com/ziglang/logo/master/zig-mark.svg" width="80" height="80" alt="Zig Logo">
 </p>
 
 <h1 align="center">ZSON</h1>
