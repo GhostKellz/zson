@@ -2,26 +2,26 @@ const std = @import("std");
 
 pub const TokenType = enum {
     // Delimiters
-    left_brace,    // {
-    right_brace,   // }
-    left_bracket,  // [
+    left_brace, // {
+    right_brace, // }
+    left_bracket, // [
     right_bracket, // ]
-    colon,         // :
-    comma,         // ,
+    colon, // :
+    comma, // ,
 
     // Literals
-    string,        // "hello" or 'hello' or """multiline"""
-    number,        // 42, 3.14, 0xFF, 0b1010
-    true_lit,      // true
-    false_lit,     // false
-    null_lit,      // null
+    string, // "hello" or 'hello' or """multiline"""
+    number, // 42, 3.14, 0xFF, 0b1010
+    true_lit, // true
+    false_lit, // false
+    null_lit, // null
     undefined_lit, // undefined
-    infinity,      // Infinity
-    nan,           // NaN
+    infinity, // Infinity
+    nan, // NaN
 
     // Special
-    identifier,    // unquoted key
-    type_hint,     // @i32, @string
+    identifier, // unquoted key
+    type_hint, // @i32, @string
     eof,
 };
 
@@ -217,6 +217,15 @@ pub const Lexer = struct {
             return self.makeToken(.number, start, start_column);
         }
 
+        // Octal: 0o...
+        if (first == '0' and !self.isAtEnd() and (self.peek() == 'o' or self.peek() == 'O')) {
+            _ = self.advance();
+            while (!self.isAtEnd() and isOctalDigit(self.peek())) {
+                _ = self.advance();
+            }
+            return self.makeToken(.number, start, start_column);
+        }
+
         // Decimal integer/float
         while (!self.isAtEnd() and isDigit(self.peek())) {
             _ = self.advance();
@@ -332,6 +341,10 @@ pub const Lexer = struct {
         return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
     }
 
+    fn isOctalDigit(c: u8) bool {
+        return c >= '0' and c <= '7';
+    }
+
     fn isAlpha(c: u8) bool {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
     }
@@ -380,10 +393,10 @@ test "lexer strings" {
 }
 
 test "lexer numbers" {
-    const source = "42 3.14 0xFF 0b1010 -5";
+    const source = "42 3.14 0xFF 0b1010 -5 0o755";
     var lexer = Lexer.init(source);
 
-    for (0..5) |_| {
+    for (0..6) |_| {
         const token = try lexer.nextToken();
         try std.testing.expectEqual(TokenType.number, token.type);
     }

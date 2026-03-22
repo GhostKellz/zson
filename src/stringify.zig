@@ -6,6 +6,7 @@ pub const StringifyOptions = struct {
     use_unquoted_keys: bool = true,
     use_trailing_commas: bool = true,
     use_single_quotes: bool = false,
+    compact: bool = false, // No whitespace when true
 };
 
 pub fn stringify(
@@ -13,7 +14,7 @@ pub fn stringify(
     value: ast.Value,
     options: StringifyOptions,
 ) ![]const u8 {
-    var buffer = std.ArrayList(u8){};
+    var buffer: std.ArrayList(u8) = .empty;
     errdefer buffer.deinit(allocator);
 
     try stringifyValue(allocator, &buffer, value, options, 0);
@@ -49,6 +50,27 @@ fn stringifyObject(
     options: StringifyOptions,
     depth: usize,
 ) std.mem.Allocator.Error!void {
+    if (options.compact) {
+        try buffer.append(allocator, '{');
+        var iter = obj.iterator();
+        var first = true;
+        while (iter.next()) |entry| {
+            if (!first) try buffer.append(allocator, ',');
+            first = false;
+
+            const key = entry.key_ptr.*;
+            if (options.use_unquoted_keys and isValidIdentifier(key) and !isReservedWord(key)) {
+                try buffer.appendSlice(allocator, key);
+            } else {
+                try stringifyString(allocator, buffer, key, options);
+            }
+            try buffer.append(allocator, ':');
+            try stringifyValue(allocator, buffer, entry.value_ptr.*, options, depth + 1);
+        }
+        try buffer.append(allocator, '}');
+        return;
+    }
+
     try buffer.appendSlice(allocator, "{\n");
 
     var iter = obj.iterator();
@@ -64,7 +86,7 @@ fn stringifyObject(
 
         // Key
         const key = entry.key_ptr.*;
-        if (options.use_unquoted_keys and isValidIdentifier(key)) {
+        if (options.use_unquoted_keys and isValidIdentifier(key) and !isReservedWord(key)) {
             try buffer.appendSlice(allocator, key);
         } else {
             try stringifyString(allocator, buffer, key, options);
@@ -92,6 +114,16 @@ fn stringifyArray(
     options: StringifyOptions,
     depth: usize,
 ) std.mem.Allocator.Error!void {
+    if (options.compact) {
+        try buffer.append(allocator, '[');
+        for (arr.items, 0..) |item, i| {
+            if (i > 0) try buffer.append(allocator, ',');
+            try stringifyValue(allocator, buffer, item, options, depth);
+        }
+        try buffer.append(allocator, ']');
+        return;
+    }
+
     // Inline arrays if all elements are simple
     const is_simple = blk: {
         for (arr.items) |item| {
@@ -164,10 +196,12 @@ fn stringifyString(
 }
 
 fn stringifyNumber(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), num: ast.Value.Number) std.mem.Allocator.Error!void {
+    // Use stack buffer to avoid allocation
+    var buf: [128]u8 = undefined;
+
     switch (num) {
         .integer => |i| {
-            const str = try std.fmt.allocPrint(allocator, "{d}", .{i});
-            defer allocator.free(str);
+            const str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch unreachable;
             try buffer.appendSlice(allocator, str);
         },
         .float => |f| {
@@ -180,19 +214,20 @@ fn stringifyNumber(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), num
             } else if (std.math.isNan(f)) {
                 try buffer.appendSlice(allocator, "NaN");
             } else {
-                const str = try std.fmt.allocPrint(allocator, "{d}", .{f});
-                defer allocator.free(str);
+                const str = std.fmt.bufPrint(&buf, "{d}", .{f}) catch unreachable;
                 try buffer.appendSlice(allocator, str);
             }
         },
         .hex => |h| {
-            const str = try std.fmt.allocPrint(allocator, "0x{X}", .{h});
-            defer allocator.free(str);
+            const str = std.fmt.bufPrint(&buf, "0x{X}", .{h}) catch unreachable;
             try buffer.appendSlice(allocator, str);
         },
         .binary => |b| {
-            const str = try std.fmt.allocPrint(allocator, "0b{b}", .{b});
-            defer allocator.free(str);
+            const str = std.fmt.bufPrint(&buf, "0b{b}", .{b}) catch unreachable;
+            try buffer.appendSlice(allocator, str);
+        },
+        .octal => |o| {
+            const str = std.fmt.bufPrint(&buf, "0o{o}", .{o}) catch unreachable;
             try buffer.appendSlice(allocator, str);
         },
     }
@@ -200,8 +235,8 @@ fn stringifyNumber(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), num
 
 fn writeIndent(allocator: std.mem.Allocator, buffer: *std.ArrayList(u8), indent: usize, depth: usize) std.mem.Allocator.Error!void {
     const total = indent * depth;
-    for (0..total) |_| {
-        try buffer.append(allocator, ' ');
+    if (total > 0) {
+        try buffer.appendNTimes(allocator, ' ', total);
     }
 }
 
@@ -222,19 +257,74 @@ fn isValidIdentifier(str: []const u8) bool {
     return true;
 }
 
+fn isReservedWord(str: []const u8) bool {
+    const reserved = [_][]const u8{
+        "true",
+        "false",
+        "null",
+        "undefined",
+        "Infinity",
+        "NaN",
+    };
+    for (reserved) |word| {
+        if (std.mem.eql(u8, str, word)) return true;
+    }
+    return false;
+}
+
 // Tests
 test "stringify simple object" {
+    // Use allocated strings to avoid double-free issues
+    const name_key = try std.testing.allocator.dupe(u8, "name");
+    const age_key = try std.testing.allocator.dupe(u8, "age");
+    const name_val = try std.testing.allocator.dupe(u8, "Alice");
+
     var obj = ast.Value.Object.init(std.testing.allocator);
-    defer obj.deinit();
 
-    try obj.put("name", ast.Value{ .string = "Alice" });
-    try obj.put("age", ast.Value{ .number = .{ .integer = 30 } });
+    try obj.put(name_key, ast.Value{ .string = name_val });
+    try obj.put(age_key, ast.Value{ .number = .{ .integer = 30 } });
 
-    const value = ast.Value{ .object = obj };
+    var value = ast.Value{ .object = obj };
+    defer value.deinit(std.testing.allocator);
 
     const result = try stringify(std.testing.allocator, value, .{});
     defer std.testing.allocator.free(result);
 
-    // Just check it doesn't crash
+    // Check it produces valid output
     try std.testing.expect(result.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result, "name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Alice") != null);
+}
+
+test "stringify with escapes" {
+    const key = try std.testing.allocator.dupe(u8, "message");
+    const val = try std.testing.allocator.dupe(u8, "hello\nworld");
+
+    var obj = ast.Value.Object.init(std.testing.allocator);
+    try obj.put(key, ast.Value{ .string = val });
+
+    var value = ast.Value{ .object = obj };
+    defer value.deinit(std.testing.allocator);
+
+    const result = try stringify(std.testing.allocator, value, .{});
+    defer std.testing.allocator.free(result);
+
+    // Should escape the newline
+    try std.testing.expect(std.mem.indexOf(u8, result, "\\n") != null);
+}
+
+test "stringify compact mode" {
+    const key = try std.testing.allocator.dupe(u8, "x");
+
+    var obj = ast.Value.Object.init(std.testing.allocator);
+    try obj.put(key, ast.Value{ .number = .{ .integer = 1 } });
+
+    var value = ast.Value{ .object = obj };
+    defer value.deinit(std.testing.allocator);
+
+    const result = try stringify(std.testing.allocator, value, .{ .compact = true });
+    defer std.testing.allocator.free(result);
+
+    // Compact mode should have no newlines
+    try std.testing.expect(std.mem.indexOf(u8, result, "\n") == null);
 }

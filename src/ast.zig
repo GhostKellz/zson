@@ -17,6 +17,7 @@ pub const Value = union(enum) {
         float: f64,
         hex: u64,
         binary: u64,
+        octal: u64,
     };
 
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
@@ -36,6 +37,7 @@ pub const Value = union(enum) {
                 for (arr.items) |*item| {
                     item.deinit(allocator);
                 }
+                // ArrayList is now unmanaged - pass allocator to deinit
                 arr.deinit(allocator);
             },
             .string => |str| {

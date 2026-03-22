@@ -11,12 +11,38 @@ pub const stringify = @import("stringify.zig");
 pub const Lexer = lexer.Lexer;
 pub const Parser = parser.Parser;
 pub const Value = ast.Value;
+pub const ErrorInfo = parser.ErrorInfo;
+pub const StringifyOptions = stringify.StringifyOptions;
+
+/// Result type for parsing with error info
+pub const ParseResult = struct {
+    value: ?Value,
+    error_info: ?ErrorInfo,
+
+    pub fn isOk(self: ParseResult) bool {
+        return self.value != null;
+    }
+};
 
 /// Parse ZSON string into a Value
 pub fn parse(allocator: std.mem.Allocator, source: []const u8) !Value {
     var lex = Lexer.init(source);
     var p = try Parser.init(allocator, &lex);
     return try p.parse();
+}
+
+/// Parse ZSON string with detailed error information
+pub fn parseWithInfo(allocator: std.mem.Allocator, source: []const u8) ParseResult {
+    var lex = Lexer.init(source);
+    var p = Parser.init(allocator, &lex) catch {
+        return .{ .value = null, .error_info = null };
+    };
+
+    const value = p.parse() catch {
+        return .{ .value = null, .error_info = p.getErrorInfo() };
+    };
+
+    return .{ .value = value, .error_info = null };
 }
 
 /// Convert Value to ZSON string

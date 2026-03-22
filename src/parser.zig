@@ -13,16 +13,29 @@ pub const ParseError = error{
     Overflow,
 };
 
+/// Detailed error information with location
+pub const ErrorInfo = struct {
+    line: usize,
+    column: usize,
+    message: []const u8,
+
+    pub fn format(self: ErrorInfo, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        try writer.print("line {d}, column {d}: {s}", .{ self.line, self.column, self.message });
+    }
+};
+
 pub const Parser = struct {
     lexer: *lexer.Lexer,
     current: lexer.Token,
     allocator: std.mem.Allocator,
+    last_error: ?ErrorInfo = null,
 
     pub fn init(allocator: std.mem.Allocator, lex: *lexer.Lexer) !Parser {
         var parser = Parser{
             .lexer = lex,
             .current = undefined,
             .allocator = allocator,
+            .last_error = null,
         };
         parser.current = try parser.lexer.nextToken();
         return parser;
@@ -30,6 +43,19 @@ pub const Parser = struct {
 
     pub fn parse(self: *Parser) !ast.Value {
         return try self.parseValue();
+    }
+
+    /// Get the last error information (if any)
+    pub fn getErrorInfo(self: *Parser) ?ErrorInfo {
+        return self.last_error;
+    }
+
+    fn setError(self: *Parser, message: []const u8) void {
+        self.last_error = ErrorInfo{
+            .line = self.current.line,
+            .column = self.current.column,
+            .message = message,
+        };
     }
 
     fn parseValue(self: *Parser) ParseError!ast.Value {
@@ -43,7 +69,10 @@ pub const Parser = struct {
             .null_lit => try self.parseNull(),
             .undefined_lit => try self.parseUndefined(),
             .infinity, .nan => try self.parseSpecialNumber(),
-            else => ParseError.UnexpectedToken,
+            else => {
+                self.setError("unexpected token");
+                return ParseError.UnexpectedToken;
+            },
         };
     }
 
@@ -51,6 +80,16 @@ pub const Parser = struct {
         try self.consume(.left_brace);
 
         var obj = ast.Value.Object.init(self.allocator);
+        errdefer {
+            // Clean up all allocated keys and values on error
+            var iter = obj.iterator();
+            while (iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                var val = entry.value_ptr;
+                val.deinit(self.allocator);
+            }
+            obj.deinit();
+        }
 
         while (self.current.type != .right_brace and self.current.type != .eof) {
             // Parse key (identifier or string)
@@ -68,11 +107,13 @@ pub const Parser = struct {
                 },
                 else => return ParseError.UnexpectedToken,
             };
+            errdefer self.allocator.free(key);
 
             try self.consume(.colon);
 
             // Parse value
-            const value = try self.parseValue();
+            var value = try self.parseValue();
+            errdefer value.deinit(self.allocator);
 
             // Skip optional type hint
             if (self.current.type == .type_hint) {
@@ -101,10 +142,18 @@ pub const Parser = struct {
     fn parseArray(self: *Parser) !ast.Value {
         try self.consume(.left_bracket);
 
-        var arr = ast.Value.Array{};
+        var arr: ast.Value.Array = .empty;
+        errdefer {
+            // Clean up all allocated values on error
+            for (arr.items) |*item| {
+                item.deinit(self.allocator);
+            }
+            arr.deinit(self.allocator);
+        }
 
         while (self.current.type != .right_bracket and self.current.type != .eof) {
-            const value = try self.parseValue();
+            var value = try self.parseValue();
+            errdefer value.deinit(self.allocator);
 
             // Skip optional type hint
             if (self.current.type == .type_hint) {
@@ -145,12 +194,101 @@ pub const Parser = struct {
         // Check for multiline string """
         if (lexeme.len >= 6 and std.mem.startsWith(u8, lexeme, "\"\"\"")) {
             const content = lexeme[3 .. lexeme.len - 3];
-            return try self.allocator.dupe(u8, content);
+            return try self.processEscapes(content);
         }
 
         // Single or double quoted
         const content = lexeme[1 .. lexeme.len - 1];
-        return try self.allocator.dupe(u8, content);
+        return try self.processEscapes(content);
+    }
+
+    fn processEscapes(self: *Parser, content: []const u8) ![]const u8 {
+        // Fast path: no escapes
+        if (std.mem.indexOfScalar(u8, content, '\\') == null) {
+            return try self.allocator.dupe(u8, content);
+        }
+
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(self.allocator);
+
+        var i: usize = 0;
+        while (i < content.len) {
+            if (content[i] == '\\' and i + 1 < content.len) {
+                const next = content[i + 1];
+                switch (next) {
+                    'n' => {
+                        try result.append(self.allocator, '\n');
+                        i += 2;
+                    },
+                    't' => {
+                        try result.append(self.allocator, '\t');
+                        i += 2;
+                    },
+                    'r' => {
+                        try result.append(self.allocator, '\r');
+                        i += 2;
+                    },
+                    '\\' => {
+                        try result.append(self.allocator, '\\');
+                        i += 2;
+                    },
+                    '"' => {
+                        try result.append(self.allocator, '"');
+                        i += 2;
+                    },
+                    '\'' => {
+                        try result.append(self.allocator, '\'');
+                        i += 2;
+                    },
+                    '/' => {
+                        try result.append(self.allocator, '/');
+                        i += 2;
+                    },
+                    'b' => {
+                        try result.append(self.allocator, 0x08); // backspace
+                        i += 2;
+                    },
+                    'f' => {
+                        try result.append(self.allocator, 0x0C); // form feed
+                        i += 2;
+                    },
+                    'u' => {
+                        // Unicode escape: \uXXXX
+                        if (i + 5 < content.len) {
+                            const hex = content[i + 2 .. i + 6];
+                            if (std.fmt.parseInt(u21, hex, 16)) |codepoint| {
+                                var buf: [4]u8 = undefined;
+                                const len = std.unicode.utf8Encode(codepoint, &buf) catch {
+                                    // Invalid codepoint, keep as-is
+                                    try result.append(self.allocator, content[i]);
+                                    i += 1;
+                                    continue;
+                                };
+                                try result.appendSlice(self.allocator, buf[0..len]);
+                                i += 6;
+                            } else |_| {
+                                // Invalid hex, keep as-is
+                                try result.append(self.allocator, content[i]);
+                                i += 1;
+                            }
+                        } else {
+                            try result.append(self.allocator, content[i]);
+                            i += 1;
+                        }
+                    },
+                    else => {
+                        // Unknown escape, keep as-is
+                        try result.append(self.allocator, content[i]);
+                        i += 1;
+                    },
+                }
+            } else {
+                try result.append(self.allocator, content[i]);
+                i += 1;
+            }
+        }
+
+        return try result.toOwnedSlice(self.allocator);
     }
 
     fn parseNumber(self: *Parser) !ast.Value {
@@ -170,6 +308,14 @@ pub const Parser = struct {
             const value = try std.fmt.parseInt(u64, bin_str, 2);
             try self.advance();
             return ast.Value{ .number = .{ .binary = value } };
+        }
+
+        // Octal
+        if (std.mem.startsWith(u8, lexeme, "0o") or std.mem.startsWith(u8, lexeme, "0O")) {
+            const oct_str = lexeme[2..];
+            const value = try std.fmt.parseInt(u64, oct_str, 8);
+            try self.advance();
+            return ast.Value{ .number = .{ .octal = value } };
         }
 
         // Float or integer
@@ -218,6 +364,7 @@ pub const Parser = struct {
 
     fn consume(self: *Parser, token_type: lexer.TokenType) !void {
         if (self.current.type != token_type) {
+            self.setError("unexpected token");
             return ParseError.UnexpectedToken;
         }
         try self.advance();
@@ -272,4 +419,29 @@ test "parse trailing commas" {
     defer value.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(ast.Value.object, std.meta.activeTag(value));
+}
+
+test "parse escape sequences" {
+    const source = "{\"msg\": \"hello\\nworld\\t!\"}";
+    var lex = lexer.Lexer.init(source);
+    var parser = try Parser.init(std.testing.allocator, &lex);
+
+    var value = try parser.parse();
+    defer value.deinit(std.testing.allocator);
+
+    const msg = value.object.get("msg").?;
+    try std.testing.expectEqualStrings("hello\nworld\t!", msg.string);
+}
+
+test "parse octal numbers" {
+    const source = "[0o755, 0o644]";
+    var lex = lexer.Lexer.init(source);
+    var parser = try Parser.init(std.testing.allocator, &lex);
+
+    var value = try parser.parse();
+    defer value.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(ast.Value.array, std.meta.activeTag(value));
+    try std.testing.expectEqual(@as(u64, 0o755), value.array.items[0].number.octal);
+    try std.testing.expectEqual(@as(u64, 0o644), value.array.items[1].number.octal);
 }
